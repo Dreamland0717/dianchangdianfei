@@ -1,5 +1,5 @@
 #!/bin/bash
-# 电力消耗分析项目 Git 初始化脚本
+# 统调电厂用电量计算程序 Git 初始化脚本
 
 # 初始化 Git 仓库
 git init
@@ -8,7 +8,7 @@ git init
 git add .
 
 # 创建第一个提交
-git commit -m "Initial commit: 电力消耗分析项目"
+git commit -m "Initial commit: 统调电厂用电量计算程序"
 
 # 添加 origin 远程仓库 (需要您替换为实际的仓库地址)
 # git remote add origin <your-repository-url>

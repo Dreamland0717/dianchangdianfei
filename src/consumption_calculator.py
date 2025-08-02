@@ -1,5 +1,5 @@
 """
-耗电量计算模块
+统调电厂用电量计算模块
 """
 
 import pandas as pd
@@ -9,19 +9,26 @@ import os
 import traceback
 from utils import get_asset_id_from_filename
 from config import (
-    OUTPUT_DIR, TARGET_METERS, ENERGY_COLS, 
-    RULE1_IDS, RULE2_IDS, RULE3_IDS
+    OUTPUT_DIR, TARGET_METERS, ENERGY_COLS
 )
 
-def calculate_net_value(forward, reverse, asset_id, is_change_point_interval):
-    """根据资产编号计算净电量增量"""
-    if asset_id in RULE1_IDS:
+def calculate_net_value(forward, reverse, asset_id, is_change_point_interval, calculation_rules, transformation_ratios):
+    """根据资产编号和配置计算净电量增量"""
+    # 获取该电能表的计算规则和变比值
+    rule_choice = calculation_rules.get(asset_id, 1)  # 默认使用规则1
+    ratio = transformation_ratios.get(asset_id, 1.0)  # 默认变比值为1.0
+    
+    # 如果规则是4（不计算），则返回0
+    if rule_choice == 4:
+        return 0.0, 0.0, "不计算(跳过)", False, ratio
+    
+    if rule_choice == 1:
         net_value = forward - reverse
         rule = "正向 - 反向"
-    elif asset_id in RULE2_IDS:
+    elif rule_choice == 2:
         net_value = reverse - forward
         rule = "反向 - 正向"
-    elif asset_id in RULE3_IDS:
+    elif rule_choice == 3:
         net_value = forward
         rule = "只取正向"
     else:
@@ -39,9 +46,13 @@ def calculate_net_value(forward, reverse, asset_id, is_change_point_interval):
         adjusted = False
         net_value = round(net_value, 4)
     
-    return net_value, original_net_value, rule, adjusted
+    # 应用变比值
+    final_net_value = net_value * ratio
+    final_original_net_value = original_net_value * ratio
+    
+    return final_net_value, final_original_net_value, rule, adjusted, ratio
 
-def calculate_downtime_consumption(power_file, downtime_intervals, change_points):
+def calculate_downtime_consumption(power_file, downtime_intervals, change_points, calculation_rules, transformation_ratios):
     """计算停机时间段内的净电量增量"""
     try:
         print(f"\n处理电量文件: {power_file}")
@@ -58,6 +69,11 @@ def calculate_downtime_consumption(power_file, downtime_intervals, change_points
         # 从文件名中提取资产编号
         asset_id = get_asset_id_from_filename(os.path.basename(power_file))
         print(f"识别到电能表资产编号: {asset_id}")
+        
+        # 检查是否应该跳过此电能表的计算
+        if calculation_rules.get(asset_id, 1) == 4:
+            print(f"电能表 {asset_id} 设置为不计算，跳过处理")
+            return 0.0, None, None, None
         
         total_consumption = 0.0
         matched_count = 0
@@ -122,9 +138,14 @@ def calculate_downtime_consumption(power_file, downtime_intervals, change_points
             )
             
             # 根据资产编号计算净电量增量
-            net_value, original_net_value, rule_used, adjusted = calculate_net_value(
-                forward, reverse, asset_id, is_change_point_interval
+            net_value, original_net_value, rule_used, adjusted, ratio = calculate_net_value(
+                forward, reverse, asset_id, is_change_point_interval, calculation_rules, transformation_ratios
             )
+            
+            # 如果规则是不计算，则跳过
+            if rule_used == "不计算(跳过)":
+                unmatched_count += 1
+                continue
             
             # 记录边界调整
             if adjusted:
@@ -136,11 +157,12 @@ def calculate_downtime_consumption(power_file, downtime_intervals, change_points
                     '区间结束时间': interval_end,
                     '正向增量(kWh)': forward,
                     '反向增量(kWh)': reverse,
-                    '置零前净增量(kWh)': original_net_value,
-                    '置零后净增量(kWh)': net_value,
+                    '置零前净增量(kWh)': original_net_value / ratio,  # 显示原始值
+                    '置零后净增量(kWh)': net_value / ratio,  # 显示原始值
                     '所属文件': os.path.basename(power_file),
                     '资产编号': asset_id,
                     '计算规则': rule_used,
+                    '变比值': ratio,
                     '变化点时间': ', '.join([cp.strftime('%Y-%m-%d %H:%M:%S') 
                                   for cp in change_points 
                                   if interval_start <= cp < interval_end])
@@ -165,14 +187,16 @@ def calculate_downtime_consumption(power_file, downtime_intervals, change_points
                         '机组文件': os.path.basename(power_file),
                         '资产编号': asset_id,
                         '计算规则': rule_used,
+                        '变比值': ratio,
                         '停机时间段': interval_key,
                         '时间区间': interval_str,
                         '区间开始时间': interval_start,
                         '区间结束时间': interval_end,
                         '正向增量(kWh)': forward,
                         '反向增量(kWh)': reverse,
-                        '净电量增量(kWh)': net_value,
-                        '原始净电量增量(kWh)': original_net_value,
+                        '净电量增量(kWh)': net_value / ratio,  # 原始值
+                        '最终电量(kWh)': net_value,  # 应用变比后的值
+                        '原始净电量增量(kWh)': original_net_value / ratio,  # 原始值
                         '是否变化点区间': '是' if is_change_point_interval else '否',
                         '是否被置零': '是' if adjusted else '否'
                     })
@@ -211,7 +235,7 @@ def calculate_downtime_consumption(power_file, downtime_intervals, change_points
         traceback.print_exc()
         return 0.0, None, None, None
 
-def calculate_half_hourly_consumption_by_asset(power_files, downtime_intervals, start_date, end_date):
+def calculate_half_hourly_consumption_by_asset(power_files, downtime_intervals, start_date, end_date, calculation_rules, transformation_ratios):
     """按资产编号统计每个小时的30分钟时间段的正向有功电量（仅计算停电期间）"""
     try:
         print("\n开始按资产编号统计每个小时的30分钟时间段的正向有功电量...")
@@ -229,6 +253,7 @@ def calculate_half_hourly_consumption_by_asset(power_files, downtime_intervals, 
         
         # 为每个资产编号初始化结果字典
         asset_results = {}
+        asset_results_with_ratio = {}  # 应用变比后的结果
         
         # 处理每个电量文件
         for power_file in power_files:
@@ -245,9 +270,18 @@ def calculate_half_hourly_consumption_by_asset(power_files, downtime_intervals, 
                 print(f"无法从文件名 {power_file} 中提取资产编号，已跳过")
                 continue
                 
+            # 检查是否应该跳过此电能表的计算
+            if calculation_rules.get(asset_id, 1) == 4:
+                print(f"电能表 {asset_id} 设置为不计算，跳过处理")
+                continue
+                
+            # 获取变比值
+            ratio = transformation_ratios.get(asset_id, 1.0)
+                
             # 如果资产编号不在结果字典中，则初始化
             if asset_id not in asset_results:
                 asset_results[asset_id] = {label: 0.0 for label in half_hour_labels}
+                asset_results_with_ratio[asset_id] = {label: 0.0 for label in half_hour_labels}
             
             # 处理每个15分钟区间
             for index, row in df_power.iterrows():
@@ -310,17 +344,21 @@ def calculate_half_hourly_consumption_by_asset(power_files, downtime_intervals, 
                     else:
                         half_hour_label = f"{hour:02d}:30-24:00"
                 
-                # 累加到对应的时间段
+                # 累加到对应的时间段（原始值和应用变比后的值）
                 asset_results[asset_id][half_hour_label] += forward
+                asset_results_with_ratio[asset_id][half_hour_label] += forward * ratio
         
         # 创建结果DataFrame
         results_data = []
         for asset_id, half_hours_data in asset_results.items():
+            ratio = transformation_ratios.get(asset_id, 1.0)
             for half_hour, consumption in half_hours_data.items():
                 results_data.append({
                     '资产编号': asset_id,
                     '时间段': half_hour,
-                    '正向有功电量(kWh)': round(consumption, 4)
+                    '表底值(kWh)': round(consumption, 4),  # 明确标识为表底值
+                    '变比值': ratio,
+                    '最终电量(kWh)': round(consumption * ratio, 4)
                 })
         
         results_df = pd.DataFrame(results_data)
@@ -331,16 +369,19 @@ def calculate_half_hourly_consumption_by_asset(power_files, downtime_intervals, 
         traceback.print_exc()
         return None
 
-def calculate_power_consumption(downtime_intervals, change_points, start_date, end_date):
+def calculate_power_consumption(downtime_intervals, change_points, start_date, end_date, 
+                              meter_ids, calculation_rules, transformation_ratios):
     """计算停机耗电量主流程"""
     print("="*50)
-    print("机组停机耗电量计算程序")
+    print("统调电厂机组停机耗电量计算程序")
     print(f"工作目录: {OUTPUT_DIR}")
     print("="*50)
     
     # 步骤1: 计算电量文件的停机耗量
+    # 只处理需要计算的电能表
+    active_meters = [meter for meter in meter_ids if calculation_rules.get(meter, 1) != 4]
     power_files = [
-        os.path.join("output", f"96点电量增量{meter}.xlsx") for meter in TARGET_METERS
+        os.path.join("output", f"96点电量增量{meter}.xlsx") for meter in active_meters
     ]
     
     results = {}
@@ -348,18 +389,44 @@ def calculate_power_consumption(downtime_intervals, change_points, start_date, e
     all_detailed = []
     all_boundaries = []  # 收集所有置零记录
     all_consumption = []  # 收集所有机组的耗电量
+    summary_rows = []  # 存储小计和总计行
     
     for file in power_files:
         if not os.path.exists(file):
             print(f"\n警告: 文件 {file} 不存在，已跳过")
             continue
             
-        total, summary_df, detailed_df, boundary_df = calculate_downtime_consumption(file, downtime_intervals, change_points)
+        # 从文件名提取资产编号
+        asset_id = get_asset_id_from_filename(os.path.basename(file))
+        
+        # 检查是否应该跳过此电能表的计算
+        if calculation_rules.get(asset_id, 1) == 4:
+            print(f"\n电能表 {asset_id} 设置为不计算，跳过处理")
+            continue
+            
+        total, summary_df, detailed_df, boundary_df = calculate_downtime_consumption(
+            file, downtime_intervals, change_points, calculation_rules, transformation_ratios)
         results[file] = total
         
         if summary_df is not None and not summary_df.empty:
             all_summaries.append(summary_df)
             all_consumption.append(total)  # 收集每个文件的总耗电量
+            
+            # 添加小计行
+            unit_total = summary_df['总耗电量(kWh)'].sum()
+            ratio = transformation_ratios.get(asset_id, 1.0)
+            # 获取表底值（未应用变比的原始值）
+            base_value = unit_total / ratio if ratio != 0 else 0
+            summary_rows.append({
+                '机组文件': os.path.basename(file),
+                '资产编号': asset_id,
+                '表底值(kWh)': round(base_value, 4),
+                '变比值': ratio,
+                '开始时间': '小计',
+                '结束时间': '',
+                '区间数量': summary_df['区间数量'].sum(),
+                '总耗电量(kWh)': round(unit_total, 4)
+            })
         
         if detailed_df is not None and not detailed_df.empty:
             all_detailed.append(detailed_df)
@@ -372,45 +439,35 @@ def calculate_power_consumption(downtime_intervals, change_points, start_date, e
         print("-"*50)
     
     # 创建汇总文件
-    if all_summaries:
+    if all_summaries or summary_rows:
         # 合并所有汇总结果
-        combined_summary = pd.concat(all_summaries, ignore_index=True)
-        
-        # 添加机组小计行
-        unit_summaries = []
-        for file in power_files:
-            if file in results:
-                # 获取该机组的所有汇总行
-                unit_rows = combined_summary[combined_summary['机组文件'] == os.path.basename(file)]
-                if not unit_rows.empty:
-                    # 计算该机组的总耗电量
-                    unit_total = unit_rows['总耗电量(kWh)'].sum()
-                    asset_id = get_asset_id_from_filename(file)
-                    unit_summaries.append({
-                        '机组文件': os.path.basename(file),
-                        '资产编号': asset_id,
-                        '开始时间': '小计',
-                        '结束时间': '',
-                        '区间数量': unit_rows['区间数量'].sum(),
-                        '总耗电量(kWh)': round(unit_total, 4)
-                    })
+        combined_summary = pd.concat(all_summaries, ignore_index=True) if all_summaries else pd.DataFrame()
         
         # 添加总电量行
-        grand_total = sum(all_consumption)
-        unit_summaries.append({
+        grand_total = sum(all_consumption) if all_consumption else 0.0
+    
+        # 计算总表底值（所有小计表底值的和）
+        total_base_value = sum([row['表底值(kWh)'] for row in summary_rows if row['开始时间'] == '小计'])
+    
+        summary_rows.append({
             '机组文件': '总计',
             '资产编号': '',
+            '表底值(kWh)': round(total_base_value, 4),
+            '变比值': '',
             '开始时间': '',
             '结束时间': '',
-            '区间数量': combined_summary['区间数量'].sum(),
+            '区间数量': combined_summary['区间数量'].sum() if not combined_summary.empty else 0,
             '总耗电量(kWh)': round(grand_total, 4)
         })
         
         # 创建小计和总计的DataFrame
-        summary_total_df = pd.DataFrame(unit_summaries)
+        summary_total_df = pd.DataFrame(summary_rows)
         
-        # 合并原始汇总数据和小计/总计数据
-        final_summary = pd.concat([combined_summary, summary_total_df], ignore_index=True)
+        # 合并原始汇总数据和小计/总计数据，将小计/总计放在前面
+        if not combined_summary.empty:
+            final_summary = pd.concat([summary_total_df, combined_summary], ignore_index=True)
+        else:
+            final_summary = summary_total_df
         
         # 保存到Excel文件
         combined_filename = os.path.join("output", "所有文件停机耗电汇总.xlsx")
@@ -420,6 +477,14 @@ def calculate_power_consumption(downtime_intervals, change_points, start_date, e
             # 如果有详细数据，也保存到同一个文件的不同sheet
             if all_detailed:
                 combined_detailed = pd.concat(all_detailed, ignore_index=True)
+                # 在详细数据中添加表底值、变比值等信息
+                if not combined_detailed.empty:
+                    # 检查列是否已存在，避免重复插入
+                    if '表底值(kWh)' not in combined_detailed.columns:
+                        combined_detailed.insert(0, '表底值(kWh)', combined_detailed['净电量增量(kWh)'])
+                    if '最终电量(kWh)' not in combined_detailed.columns:
+                        combined_detailed.insert(2, '最终电量(kWh)', combined_detailed['最终电量(kWh)'])
+                
                 combined_detailed.to_excel(writer, sheet_name='明细', index=False)
                 print(f"详细结果已保存到汇总文件的'明细'工作表")
         
@@ -439,16 +504,23 @@ def calculate_power_consumption(downtime_intervals, change_points, start_date, e
     print("\n" + "="*50)
     print("最终计算结果:")
     for file, total in results.items():
-        asset_id = get_asset_id_from_filename(file)
-        print(f"{file} (资产编号: {asset_id}): {total:.4f} kWh")
+        asset_id = get_asset_id_from_filename(os.path.basename(file))
+        ratio = transformation_ratios.get(asset_id, 1.0)
+        print(f"{file} (资产编号: {asset_id}, 变比: {ratio}): {total:.4f} kWh")
+    
+    # 确保grand_total变量有默认值
+    grand_total = sum(all_consumption) if all_consumption else 0.0
     print(f"总耗电量: {grand_total:.4f} kWh")
     print("="*50)
     
     # 添加按资产编号统计每天48个30分钟时间段的正向有功电量功能
     print("\n开始生成按资产编号统计的半小时电量数据...")
-    half_hourly_df = calculate_half_hourly_consumption_by_asset(power_files, downtime_intervals, start_date, end_date)
+    half_hourly_df = calculate_half_hourly_consumption_by_asset(
+        power_files, downtime_intervals, start_date, end_date, calculation_rules, transformation_ratios)
     
     if half_hourly_df is not None and not half_hourly_df.empty:
+        # 按资产编号统计的半小时电量数据已经包含了表底值和最终电量列
+        # 直接保存即可
         half_hourly_filename = os.path.join("output", "按资产编号统计半小时电量数据.xlsx")
         half_hourly_df.to_excel(half_hourly_filename, index=False)
         print(f"按资产编号统计的半小时电量数据已保存到: {half_hourly_filename}")

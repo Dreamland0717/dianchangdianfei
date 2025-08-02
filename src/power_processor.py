@@ -1,5 +1,5 @@
 """
-电量数据处理模块
+统调电厂电量数据处理模块
 """
 
 import pandas as pd
@@ -12,7 +12,7 @@ from config import (
     START_DATE, END_DATE, ENERGY_COLS
 )
 
-def process_power_data():
+def process_power_data(meter_ids=None, calculation_rules=None):
     """读取并预处理电量数据"""
     # 使用相对路径而不是绝对路径
     file_path = os.path.join("input", INPUT_POWER_FILE)
@@ -33,8 +33,16 @@ def process_power_data():
         # 筛选指定日期范围
         date_mask = (df['日期'] >= START_DATE) & (df['日期'] <= END_DATE)
         
+        # 如果没有提供meter_ids，则从数据中获取
+        if meter_ids is None:
+            meter_ids = TARGET_METERS if TARGET_METERS else df['电能表资产编号'].dropna().unique().tolist()
+        
+        # 只处理需要计算的电能表（排除规则4：不计算的电能表）
+        if calculation_rules:
+            meter_ids = [meter for meter in meter_ids if calculation_rules.get(meter, 1) != 4]
+        
         # 筛选指定电能表
-        meter_mask = df['电能表资产编号'].isin(TARGET_METERS)
+        meter_mask = df['电能表资产编号'].isin(meter_ids)
         df = df[date_mask & meter_mask]
         
         print(f"筛选后数据包含 {len(df)} 条记录")
@@ -53,7 +61,7 @@ def process_power_data():
     print(f"完整时间序列包含 {len(full_times)} 个时间点")
 
     # 3. 处理每个电能表
-    for meter in TARGET_METERS:
+    for meter in meter_ids:
         print(f"\n{'='*50}")
         print(f"处理电能表: {meter}")
         
@@ -64,7 +72,7 @@ def process_power_data():
             print(f"警告: 没有找到电能表 {meter} 的数据")
             # 创建空结果文件
             empty_df = pd.DataFrame(columns=['时间区间'] + [f'{col}_增量' for col in ENERGY_COLS])
-            output_file = os.path.join(output_dir, f"96点电量增量_{meter}.xlsx")
+            output_file = os.path.join(output_dir, f"96点电量增量{meter}.xlsx")
             empty_df.to_excel(output_file, index=False)
             print(f"已创建空结果文件: {output_file}")
             continue
